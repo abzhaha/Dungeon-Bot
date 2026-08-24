@@ -24,13 +24,36 @@ from solders.hash import Hash
 CONFIG_PATH = Path("config.json")
 
 PUMP_PROGRAM = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
-PUMP_GLOBAL = Pubkey.from_string("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf")
-PUMP_FEE = Pubkey.from_string("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbCvK2mKfA2324")
-PUMP_EVENT_AUTH = Pubkey.from_string("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1")
+FEE_PROGRAM = Pubkey.from_string("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ")
 TOKEN_PROGRAM = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+TOKEN_2022_PROGRAM = Pubkey.from_string("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
 ASSOCIATED_TOKEN_PROGRAM = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
 SYSTEM_PROGRAM = Pubkey.from_string("11111111111111111111111111111111")
 RENT_PROGRAM = Pubkey.from_string("SysvarRent111111111111111111111111111111111")
+
+# Pump.fun instruction discriminators
+BUY_EXACT_SOL_IN_DISC = bytes([56, 252, 116, 8, 158, 223, 205, 95])
+SELL_DISC = bytes([51, 230, 133, 164, 1, 127, 131, 173])
+
+# fee_config PDA key (same for buy AND sell on the bonding curve program)
+FEE_CONFIG_KEY = bytes([
+    1, 86, 224, 246, 147, 102, 90, 207, 68, 219, 21, 104, 191, 23, 91, 170,
+    81, 137, 203, 151, 245, 210, 255, 59, 101, 93, 43, 182, 253, 109, 24, 176,
+])
+
+# Derived PDAs (static — computed once at startup)
+def _pda(seeds, program):
+    pda, _ = Pubkey.find_program_address(seeds, program)
+    return pda
+
+GLOBAL_PDA = _pda([b"global"], PUMP_PROGRAM)
+EVENT_AUTHORITY = _pda([b"__event_authority"], PUMP_PROGRAM)
+GLOBAL_VOLUME_ACCUMULATOR = _pda([b"global_volume_accumulator"], PUMP_PROGRAM)
+FEE_CONFIG = _pda([b"fee_config", FEE_CONFIG_KEY], FEE_PROGRAM)
+
+# Fee recipient — one of the 8 Global config recipients. This const is one of
+# them and works for buys; the program accepts any configured recipient.
+FEE_RECIPIENT = Pubkey.from_string("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtRAtymTZ")
 
 JITO_TIP_ACCOUNTS = [
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
@@ -118,9 +141,21 @@ def get_associated_token_address(wallet: Pubkey, mint: Pubkey) -> Pubkey:
     return ata
 
 def get_bonding_curve_address(mint: Pubkey) -> Pubkey:
-    seeds = [b"bonding-curve", bytes(mint)]
-    pda, _ = Pubkey.find_program_address(seeds, PUMP_PROGRAM)
-    return pda
+    return _pda([b"bonding-curve", bytes(mint)], PUMP_PROGRAM)
+
+def get_bonding_curve_v2_address(mint: Pubkey) -> Pubkey:
+    # Required on every buy/sell since the Feb 2026 cashback upgrade. Must be
+    # the last account. Can be uninitialized on-chain — only used for indexing.
+    return _pda([b"bonding-curve-v2", bytes(mint)], PUMP_PROGRAM)
+
+def get_creator_vault_address(creator: Pubkey) -> Pubkey:
+    return _pda([b"creator-vault", bytes(creator)], PUMP_PROGRAM)
+
+def get_user_volume_accumulator_address(user: Pubkey) -> Pubkey:
+    return _pda([b"user_volume_accumulator", bytes(user)], PUMP_PROGRAM)
+
+def get_ata(owner: Pubkey, mint: Pubkey, token_program: Pubkey = TOKEN_PROGRAM) -> Pubkey:
+    return _pda([bytes(owner), bytes(token_program), bytes(mint)], ASSOCIATED_TOKEN_PROGRAM)
 
 def get_wallet_pubkeys(config) -> list[str]:
     pubkeys = []
@@ -129,8 +164,40 @@ def get_wallet_pubkeys(config) -> list[str]:
         pubkeys.append(str(kp.pubkey()))
     return pubkeys
 
+async def get_mint_owner(mint: str) -> Pubkey:
+    """Return the token program that owns the mint (classic SPL or Token-2022)."""
+    async with aiohttp.ClientSession() as session:
+        payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getAccountInfo",
+            "params": [mint, {"encoding": "base64"}],
+        }
+        async with session.post(RPC_URL, json=payload) as resp:
+            data = await resp.json()
+            result = data.get("result", {}).get("value")
+            if not result:
+                return TOKEN_PROGRAM
+            owner = result.get("owner", "")
+            try:
+                return Pubkey.from_string(owner)
+            except:
+                return TOKEN_PROGRAM
+
 async def get_bonding_curve_state(bonding_curve: str) -> dict | None:
-    """Fetch bonding curve account data to calculate token price."""
+    """Fetch bonding curve account data: reserves, creator, and cashback flag.
+
+    Layout (151 bytes after the Feb 2026 cashback upgrade):
+      0   disc (8)
+      8   virtual_token_reserves u64
+      16  virtual_sol_reserves   u64
+      24  real_token_reserves    u64
+      32  real_sol_reserves      u64
+      40  token_total_supply     u64
+      48  complete               bool
+      49  creator                Pubkey (32)
+      81  reserved               u8
+      82  cashback_enabled       bool
+    """
     async with aiohttp.ClientSession() as session:
         payload = {
             "jsonrpc": "2.0", "id": 1,
@@ -144,24 +211,23 @@ async def get_bonding_curve_state(bonding_curve: str) -> dict | None:
                 return None
             import base64
             raw = base64.b64decode(result["data"][0])
-            # Pump.fun bonding curve layout (after 8-byte discriminator):
-            # virtual_token_reserves: u64 (offset 8)
-            # virtual_sol_reserves: u64 (offset 16)
-            # real_token_reserves: u64 (offset 24)
-            # real_sol_reserves: u64 (offset 32)
-            # token_total_supply: u64 (offset 40)
-            # complete: bool (offset 48)
             if len(raw) < 49:
                 return None
             virtual_token = struct.unpack_from("<Q", raw, 8)[0]
             virtual_sol = struct.unpack_from("<Q", raw, 16)[0]
             real_token = struct.unpack_from("<Q", raw, 24)[0]
             real_sol = struct.unpack_from("<Q", raw, 32)[0]
+            creator = None
+            if len(raw) >= 81:
+                creator = Pubkey.from_bytes(raw[49:81])
+            cashback_enabled = len(raw) > 82 and raw[82] != 0
             return {
                 "virtual_token_reserves": virtual_token,
                 "virtual_sol_reserves": virtual_sol,
                 "real_token_reserves": real_token,
                 "real_sol_reserves": real_sol,
+                "creator": creator,
+                "cashback_enabled": cashback_enabled,
             }
 
 def calculate_tokens_out(sol_amount_lamports: int, curve_state: dict) -> int:
@@ -177,48 +243,97 @@ def calculate_tokens_out(sol_amount_lamports: int, curve_state: dict) -> int:
 # ─── Transaction Building ───────────────────────────────────────────────────
 
 def build_buy_ix(
-    mint: Pubkey, bonding_curve: Pubkey, bonding_curve_ata: Pubkey,
-    buyer: Pubkey, buyer_ata: Pubkey, token_amount: int, max_sol_cost: int,
+    mint: Pubkey, buyer: Pubkey, creator: Pubkey,
+    sol_amount: int, min_tokens_out: int,
+    token_program: Pubkey = TOKEN_PROGRAM,
+    fee_recipient: Pubkey = FEE_RECIPIENT,
 ) -> Instruction:
-    discriminator = bytes([102, 6, 61, 18, 1, 218, 235, 234])
-    data = discriminator + struct.pack("<QQ", token_amount, max_sol_cost)
+    """buy_exact_sol_in — 17 accounts. Pins SOL spent, floors tokens received.
+    Correct layout as of the Feb 2026 cashback upgrade (bonding_curve_v2 last)."""
+    bonding_curve = get_bonding_curve_address(mint)
+    bonding_curve_ata = get_ata(bonding_curve, mint, token_program)
+    buyer_ata = get_ata(buyer, mint, token_program)
+    creator_vault = get_creator_vault_address(creator)
+    user_vol = get_user_volume_accumulator_address(buyer)
+    bonding_curve_v2 = get_bonding_curve_v2_address(mint)
+
+    data = BUY_EXACT_SOL_IN_DISC + struct.pack("<QQ", sol_amount, min_tokens_out)
     accounts = [
-        AccountMeta(PUMP_GLOBAL, is_signer=False, is_writable=False),
-        AccountMeta(PUMP_FEE, is_signer=False, is_writable=True),
-        AccountMeta(mint, is_signer=False, is_writable=False),
-        AccountMeta(bonding_curve, is_signer=False, is_writable=True),
-        AccountMeta(bonding_curve_ata, is_signer=False, is_writable=True),
-        AccountMeta(buyer_ata, is_signer=False, is_writable=True),
-        AccountMeta(buyer, is_signer=True, is_writable=True),
-        AccountMeta(SYSTEM_PROGRAM, is_signer=False, is_writable=False),
-        AccountMeta(TOKEN_PROGRAM, is_signer=False, is_writable=False),
-        AccountMeta(RENT_PROGRAM, is_signer=False, is_writable=False),
-        AccountMeta(PUMP_EVENT_AUTH, is_signer=False, is_writable=False),
-        AccountMeta(PUMP_PROGRAM, is_signer=False, is_writable=False),
+        AccountMeta(GLOBAL_PDA, is_signer=False, is_writable=False),               # 0
+        AccountMeta(fee_recipient, is_signer=False, is_writable=True),             # 1
+        AccountMeta(mint, is_signer=False, is_writable=False),                     # 2
+        AccountMeta(bonding_curve, is_signer=False, is_writable=True),             # 3
+        AccountMeta(bonding_curve_ata, is_signer=False, is_writable=True),         # 4
+        AccountMeta(buyer_ata, is_signer=False, is_writable=True),                 # 5
+        AccountMeta(buyer, is_signer=True, is_writable=True),                      # 6
+        AccountMeta(SYSTEM_PROGRAM, is_signer=False, is_writable=False),           # 7
+        AccountMeta(token_program, is_signer=False, is_writable=False),            # 8
+        AccountMeta(creator_vault, is_signer=False, is_writable=True),             # 9
+        AccountMeta(EVENT_AUTHORITY, is_signer=False, is_writable=False),          # 10
+        AccountMeta(PUMP_PROGRAM, is_signer=False, is_writable=False),             # 11
+        AccountMeta(GLOBAL_VOLUME_ACCUMULATOR, is_signer=False, is_writable=False),# 12
+        AccountMeta(user_vol, is_signer=False, is_writable=True),                  # 13
+        AccountMeta(FEE_CONFIG, is_signer=False, is_writable=False),               # 14
+        AccountMeta(FEE_PROGRAM, is_signer=False, is_writable=False),              # 15
+        AccountMeta(bonding_curve_v2, is_signer=False, is_writable=False),         # 16 (NEW, last)
     ]
     return Instruction(PUMP_PROGRAM, data, accounts)
 
 def build_sell_ix(
-    mint: Pubkey, bonding_curve: Pubkey, bonding_curve_ata: Pubkey,
-    seller: Pubkey, seller_ata: Pubkey, token_amount: int, min_sol_out: int,
+    mint: Pubkey, seller: Pubkey, creator: Pubkey,
+    token_amount: int, min_sol_out: int, cashback_enabled: bool,
+    token_program: Pubkey = TOKEN_PROGRAM,
+    fee_recipient: Pubkey = FEE_RECIPIENT,
 ) -> Instruction:
-    discriminator = bytes([51, 230, 133, 164, 1, 127, 131, 173])
-    data = discriminator + struct.pack("<QQ", token_amount, min_sol_out)
+    """sell — 15 accounts (non-cashback) or 16 (cashback: +user_volume_accumulator).
+    bonding_curve_v2 is always the last account."""
+    bonding_curve = get_bonding_curve_address(mint)
+    bonding_curve_ata = get_ata(bonding_curve, mint, token_program)
+    seller_ata = get_ata(seller, mint, token_program)
+    creator_vault = get_creator_vault_address(creator)
+    bonding_curve_v2 = get_bonding_curve_v2_address(mint)
+
+    data = SELL_DISC + struct.pack("<QQ", token_amount, min_sol_out)
     accounts = [
-        AccountMeta(PUMP_GLOBAL, is_signer=False, is_writable=False),
-        AccountMeta(PUMP_FEE, is_signer=False, is_writable=True),
-        AccountMeta(mint, is_signer=False, is_writable=False),
-        AccountMeta(bonding_curve, is_signer=False, is_writable=True),
-        AccountMeta(bonding_curve_ata, is_signer=False, is_writable=True),
-        AccountMeta(seller_ata, is_signer=False, is_writable=True),
-        AccountMeta(seller, is_signer=True, is_writable=True),
-        AccountMeta(SYSTEM_PROGRAM, is_signer=False, is_writable=False),
-        AccountMeta(ASSOCIATED_TOKEN_PROGRAM, is_signer=False, is_writable=False),
-        AccountMeta(TOKEN_PROGRAM, is_signer=False, is_writable=False),
-        AccountMeta(PUMP_EVENT_AUTH, is_signer=False, is_writable=False),
-        AccountMeta(PUMP_PROGRAM, is_signer=False, is_writable=False),
+        AccountMeta(GLOBAL_PDA, is_signer=False, is_writable=False),        # 0
+        AccountMeta(fee_recipient, is_signer=False, is_writable=True),      # 1
+        AccountMeta(mint, is_signer=False, is_writable=False),             # 2
+        AccountMeta(bonding_curve, is_signer=False, is_writable=True),      # 3
+        AccountMeta(bonding_curve_ata, is_signer=False, is_writable=True),  # 4
+        AccountMeta(seller_ata, is_signer=False, is_writable=True),         # 5
+        AccountMeta(seller, is_signer=True, is_writable=True),              # 6
+        AccountMeta(SYSTEM_PROGRAM, is_signer=False, is_writable=False),    # 7
+        AccountMeta(creator_vault, is_signer=False, is_writable=True),      # 8
+        AccountMeta(token_program, is_signer=False, is_writable=False),     # 9
+        AccountMeta(EVENT_AUTHORITY, is_signer=False, is_writable=False),   # 10
+        AccountMeta(PUMP_PROGRAM, is_signer=False, is_writable=False),      # 11
+        AccountMeta(FEE_CONFIG, is_signer=False, is_writable=False),        # 12
+        AccountMeta(FEE_PROGRAM, is_signer=False, is_writable=False),       # 13
     ]
+    # Cashback tokens need user_volume_accumulator BEFORE bonding_curve_v2
+    if cashback_enabled:
+        user_vol = get_user_volume_accumulator_address(seller)
+        accounts.append(AccountMeta(user_vol, is_signer=False, is_writable=True))  # 14
+    accounts.append(AccountMeta(bonding_curve_v2, is_signer=False, is_writable=False))  # last
     return Instruction(PUMP_PROGRAM, data, accounts)
+
+def build_create_ata_idempotent_ix(payer: Pubkey, owner: Pubkey, mint: Pubkey,
+                                   token_program: Pubkey = TOKEN_PROGRAM) -> Instruction:
+    """Idempotent ATA creation (instruction discriminator 1 = create_idempotent).
+    Won't fail if the ATA already exists."""
+    ata = get_ata(owner, mint, token_program)
+    return Instruction(
+        ASSOCIATED_TOKEN_PROGRAM,
+        bytes([1]),
+        [
+            AccountMeta(payer, is_signer=True, is_writable=True),
+            AccountMeta(ata, is_signer=False, is_writable=True),
+            AccountMeta(owner, is_signer=False, is_writable=False),
+            AccountMeta(mint, is_signer=False, is_writable=False),
+            AccountMeta(SYSTEM_PROGRAM, is_signer=False, is_writable=False),
+            AccountMeta(token_program, is_signer=False, is_writable=False),
+        ],
+    )
 
 async def send_tx_rpc(keypair: Keypair, instructions: list) -> str:
     """Send transaction via normal RPC (used for sells — no Jito tip needed)."""
@@ -320,8 +435,13 @@ class SellSelect(discord.ui.Select):
         active = config.get("active_wallets", list(range(len(config["wallets"]))))
         mint_pubkey = Pubkey.from_string(self.mint)
         bonding_curve = get_bonding_curve_address(mint_pubkey)
-        bonding_curve_ata = get_associated_token_address(bonding_curve, mint_pubkey)
         settings = config.get("settings", {})
+
+        # Read creator + cashback flag + token program once
+        curve_state = await get_bonding_curve_state(str(bonding_curve))
+        creator = curve_state["creator"] if curve_state and curve_state.get("creator") else mint_pubkey
+        cashback = curve_state.get("cashback_enabled", False) if curve_state else False
+        token_program = await get_mint_owner(self.mint)
 
         results = []
         # Stagger sells with random delays to avoid linking wallets
@@ -329,17 +449,15 @@ class SellSelect(discord.ui.Select):
             try:
                 kp = Keypair.from_base58_string(config["wallets"][i])
                 seller = kp.pubkey()
-                seller_ata = get_associated_token_address(seller, mint_pubkey)
                 balance = await get_token_balance(str(seller), self.mint)
                 if balance <= 0:
                     results.append(f"❌ Wallet {i+1}: no tokens")
                     continue
                 sell_amount = int(balance * (pct / 100) * 1e6)
                 sell_ix = build_sell_ix(
-                    mint_pubkey, bonding_curve, bonding_curve_ata,
-                    seller, seller_ata, sell_amount, 0,
+                    mint_pubkey, seller, creator, sell_amount, 0, cashback, token_program,
                 )
-                cu_limit = set_compute_unit_limit(300_000)
+                cu_limit = set_compute_unit_limit(250_000)
                 cu_price = set_compute_unit_price(settings.get("priority_fee", 200000))
                 sig = await send_tx_rpc(kp, [cu_limit, cu_price, sell_ix])
                 results.append(f"✅ Wallet {i+1}: sold {pct}% — `{sig}`")
@@ -694,24 +812,26 @@ async def sellall(interaction: discord.Interaction, mint: str):
     settings = config.get("settings", {})
     mint_pubkey = Pubkey.from_string(mint)
     bonding_curve = get_bonding_curve_address(mint_pubkey)
-    bonding_curve_ata = get_associated_token_address(bonding_curve, mint_pubkey)
+
+    curve_state = await get_bonding_curve_state(str(bonding_curve))
+    creator = curve_state["creator"] if curve_state and curve_state.get("creator") else mint_pubkey
+    cashback = curve_state.get("cashback_enabled", False) if curve_state else False
+    token_program = await get_mint_owner(mint)
 
     results = []
     for i in active:
         try:
             kp = Keypair.from_base58_string(config["wallets"][i])
             seller = kp.pubkey()
-            seller_ata = get_associated_token_address(seller, mint_pubkey)
             balance = await get_token_balance(str(seller), mint)
             if balance <= 0:
                 results.append(f"⬜ Wallet {i+1}: no tokens")
                 continue
             sell_amount = int(balance * 1e6)
             sell_ix = build_sell_ix(
-                mint_pubkey, bonding_curve, bonding_curve_ata,
-                seller, seller_ata, sell_amount, 0,
+                mint_pubkey, seller, creator, sell_amount, 0, cashback, token_program,
             )
-            cu_limit = set_compute_unit_limit(300_000)
+            cu_limit = set_compute_unit_limit(250_000)
             cu_price = set_compute_unit_price(settings.get("priority_fee", 200000))
             sig = await send_tx_rpc(kp, [cu_limit, cu_price, sell_ix])
             results.append(f"✅ Wallet {i+1}: sold all — `{sig}`")
@@ -886,55 +1006,59 @@ async def watch_and_snipe(
 
                     mint_pubkey = Pubkey.from_string(mint_address)
                     bonding_curve = get_bonding_curve_address(mint_pubkey)
-                    bonding_curve_ata = get_associated_token_address(bonding_curve, mint_pubkey)
                     per_wallet = total_sol / len(active_indices)
+                    sol_lamports = int(per_wallet * 1e9)
 
-                    async def buy_for_wallet(wallet_idx, token_amount, sol_lamports, max_cost):
-                        """Each wallet builds and sends its own independent transaction."""
+                    # Resolve creator + token program from chain. The create tx we
+                    # detected has account[6] = creator; but reading the bonding
+                    # curve is authoritative and also gives reserves for min-out.
+                    creator = None
+                    token_program = TOKEN_PROGRAM
+                    min_tokens_out = 0
+                    try:
+                        curve_state = await get_bonding_curve_state(str(bonding_curve))
+                        if curve_state and curve_state.get("creator"):
+                            creator = curve_state["creator"]
+                            expected = calculate_tokens_out(sol_lamports, curve_state)
+                            # floor tokens at (1 - slippage); 0 = accept any (aggressive)
+                            min_tokens_out = int(expected * (1 - slippage_pct / 100))
+                    except Exception as e:
+                        print(f"curve read failed: {e}")
+
+                    # Fall back to the create tx's creator (account index 6)
+                    if creator is None:
+                        try:
+                            if len(account_keys) > 6:
+                                creator = Pubkey.from_string(account_keys[6])
+                        except:
+                            pass
+                    if creator is None:
+                        creator = mint_pubkey  # last-ditch; will likely fail, logged below
+
+                    try:
+                        token_program = await get_mint_owner(mint_address)
+                    except:
+                        token_program = TOKEN_PROGRAM
+
+                    async def buy_for_wallet(wallet_idx):
+                        """Each wallet builds and sends its own independent tx (no cross-wallet linking)."""
                         kp = Keypair.from_base58_string(config["wallets"][wallet_idx])
                         buyer = kp.pubkey()
-                        buyer_ata = get_associated_token_address(buyer, mint_pubkey)
 
-                        create_ata_ix = Instruction(
-                            ASSOCIATED_TOKEN_PROGRAM, bytes(),
-                            [
-                                AccountMeta(buyer, is_signer=True, is_writable=True),
-                                AccountMeta(buyer_ata, is_signer=False, is_writable=True),
-                                AccountMeta(buyer, is_signer=False, is_writable=False),
-                                AccountMeta(mint_pubkey, is_signer=False, is_writable=False),
-                                AccountMeta(SYSTEM_PROGRAM, is_signer=False, is_writable=False),
-                                AccountMeta(TOKEN_PROGRAM, is_signer=False, is_writable=False),
-                            ],
+                        create_ata_ix = build_create_ata_idempotent_ix(
+                            buyer, buyer, mint_pubkey, token_program
                         )
-
                         buy_ix = build_buy_ix(
-                            mint_pubkey, bonding_curve, bonding_curve_ata,
-                            buyer, buyer_ata, token_amount, max_cost,
+                            mint_pubkey, buyer, creator,
+                            sol_lamports, min_tokens_out, token_program,
                         )
-
-                        cu_limit = set_compute_unit_limit(300_000)
+                        cu_limit = set_compute_unit_limit(250_000)
                         cu_price = set_compute_unit_price(priority)
                         return await send_tx_rpc(kp, [cu_limit, cu_price, create_ata_ix, buy_ix])
 
-                    # Calculate token amount from bonding curve
-                    sol_lamports = int(per_wallet * 1e9)
-                    max_cost = int(sol_lamports * (1 + slippage_pct / 100))
-
-                    try:
-                        curve_state = await get_bonding_curve_state(str(bonding_curve))
-                        if curve_state:
-                            token_amount = calculate_tokens_out(sol_lamports, curve_state)
-                            # Apply slippage — accept fewer tokens
-                            token_amount = int(token_amount * (1 - slippage_pct / 100))
-                        else:
-                            # Fallback: use a large token amount and let max_cost be the real limit
-                            token_amount = 1_000_000_000_000
-                    except:
-                        token_amount = 1_000_000_000_000
-
                     # Fire ALL buys concurrently — speed matters for sniping
                     results = await asyncio.gather(
-                        *[buy_for_wallet(i, token_amount, sol_lamports, max_cost) for i in active_indices],
+                        *[buy_for_wallet(i) for i in active_indices],
                         return_exceptions=True,
                     )
 
