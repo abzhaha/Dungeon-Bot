@@ -743,7 +743,22 @@ async def watch_and_snipe(
     slippage_pct = settings.get("slippage", 50)
     tip = settings.get("jito_tip", 0.001)
     priority = settings.get("priority_fee", 200000)
-    last_sig = None
+    seen_sigs = set()
+
+    # Anchor: grab current sigs so we don't trigger on old txs
+    try:
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getSignaturesForAddress",
+                "params": [dev_wallet, {"limit": 10, "commitment": "confirmed"}],
+            }
+            async with session.post(RPC_URL, json=payload) as resp:
+                data = await resp.json()
+                for s in data.get("result", []):
+                    seen_sigs.add(s["signature"])
+    except:
+        pass
 
     await channel.send(f"👀 Watching `{dev_wallet[:8]}...` for Pump.fun launch...")
 
@@ -763,10 +778,11 @@ async def watch_and_snipe(
                     await asyncio.sleep(0.5)
                     continue
 
-                for sig_info in sigs:
+                # Check newest sigs we haven't seen
+                new_sigs = [s for s in sigs if s["signature"] not in seen_sigs]
+                for sig_info in new_sigs:
                     sig = sig_info["signature"]
-                    if sig == last_sig:
-                        continue
+                    seen_sigs.add(sig)
 
                     tx_payload = {
                         "jsonrpc": "2.0", "id": 1,
@@ -784,7 +800,10 @@ async def watch_and_snipe(
                     if not tx:
                         continue
 
-                    last_sig = sig
+                    # Check for failed tx
+                    if tx.get("meta", {}).get("err"):
+                        continue
+
                     msg = tx.get("transaction", {}).get("message", {})
                     account_keys = []
                     for ak in msg.get("accountKeys", []):
@@ -794,6 +813,14 @@ async def watch_and_snipe(
                             account_keys.append(ak)
 
                     if str(PUMP_PROGRAM) not in account_keys:
+                        continue
+
+                    # Look for a new token mint in the transaction
+                    # Check log messages for "Create" to confirm it's a token creation
+                    log_msgs = tx.get("meta", {}).get("logMessages", [])
+                    is_create = any("Create" in log or "InitializeMint" in log for log in log_msgs)
+                    if not is_create:
+                        # Could be a buy/sell by the dev, not a new launch
                         continue
 
                     post_balances = tx.get("meta", {}).get("postTokenBalances", [])
