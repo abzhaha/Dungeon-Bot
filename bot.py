@@ -175,6 +175,29 @@ def build_sell_ix(
     ]
     return Instruction(PUMP_PROGRAM, data, accounts)
 
+async def send_tx_rpc(keypair: Keypair, instructions: list) -> str:
+    """Send transaction via normal RPC (used for sells — no Jito tip needed)."""
+    buyer = keypair.pubkey()
+    blockhash = Hash.from_string(await get_recent_blockhash())
+    msg = MessageV0.try_compile(
+        payer=buyer, instructions=instructions,
+        address_lookup_table_accounts=[], recent_blockhash=blockhash,
+    )
+    tx = VersionedTransaction(msg, [keypair])
+    tx_base58 = base58.b58encode(bytes(tx)).decode()
+
+    async with aiohttp.ClientSession() as session:
+        payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "sendTransaction",
+            "params": [tx_base58, {"skipPreflight": True, "encoding": "base58"}],
+        }
+        async with session.post(RPC_URL, json=payload) as resp:
+            result = await resp.json()
+            if "error" in result:
+                raise Exception(result["error"])
+            return result.get("result", "sent")
+
 async def send_tx_jito(keypair: Keypair, instructions: list, tip: float) -> str:
     buyer = keypair.pubkey()
     blockhash = Hash.from_string(await get_recent_blockhash())
@@ -273,7 +296,7 @@ class SellSelect(discord.ui.Select):
                 )
                 cu_limit = set_compute_unit_limit(300_000)
                 cu_price = set_compute_unit_price(settings.get("priority_fee", 200000))
-                sig = await send_tx_jito(kp, [cu_limit, cu_price, sell_ix], settings.get("jito_tip", 0.001))
+                sig = await send_tx_rpc(kp, [cu_limit, cu_price, sell_ix])
                 results.append(f"✅ Wallet {i+1}: sold {pct}% — `{sig}`")
                 # Random delay between sells to avoid on-chain linking
                 await asyncio.sleep(random.uniform(1.5, 5.0))
@@ -645,7 +668,7 @@ async def sellall(interaction: discord.Interaction, mint: str):
             )
             cu_limit = set_compute_unit_limit(300_000)
             cu_price = set_compute_unit_price(settings.get("priority_fee", 200000))
-            sig = await send_tx_jito(kp, [cu_limit, cu_price, sell_ix], settings.get("jito_tip", 0.001))
+            sig = await send_tx_rpc(kp, [cu_limit, cu_price, sell_ix])
             results.append(f"✅ Wallet {i+1}: sold all — `{sig}`")
             await asyncio.sleep(random.uniform(1.5, 5.0))
         except Exception as e:
