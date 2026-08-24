@@ -129,6 +129,51 @@ def get_wallet_pubkeys(config) -> list[str]:
         pubkeys.append(str(kp.pubkey()))
     return pubkeys
 
+async def get_bonding_curve_state(bonding_curve: str) -> dict | None:
+    """Fetch bonding curve account data to calculate token price."""
+    async with aiohttp.ClientSession() as session:
+        payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getAccountInfo",
+            "params": [bonding_curve, {"encoding": "base64"}],
+        }
+        async with session.post(RPC_URL, json=payload) as resp:
+            data = await resp.json()
+            result = data.get("result", {}).get("value")
+            if not result:
+                return None
+            import base64
+            raw = base64.b64decode(result["data"][0])
+            # Pump.fun bonding curve layout (after 8-byte discriminator):
+            # virtual_token_reserves: u64 (offset 8)
+            # virtual_sol_reserves: u64 (offset 16)
+            # real_token_reserves: u64 (offset 24)
+            # real_sol_reserves: u64 (offset 32)
+            # token_total_supply: u64 (offset 40)
+            # complete: bool (offset 48)
+            if len(raw) < 49:
+                return None
+            virtual_token = struct.unpack_from("<Q", raw, 8)[0]
+            virtual_sol = struct.unpack_from("<Q", raw, 16)[0]
+            real_token = struct.unpack_from("<Q", raw, 24)[0]
+            real_sol = struct.unpack_from("<Q", raw, 32)[0]
+            return {
+                "virtual_token_reserves": virtual_token,
+                "virtual_sol_reserves": virtual_sol,
+                "real_token_reserves": real_token,
+                "real_sol_reserves": real_sol,
+            }
+
+def calculate_tokens_out(sol_amount_lamports: int, curve_state: dict) -> int:
+    """Calculate how many tokens you get for a given SOL amount using the constant product formula."""
+    virtual_sol = curve_state["virtual_sol_reserves"]
+    virtual_token = curve_state["virtual_token_reserves"]
+    # constant product: (virtual_sol + sol_in) * (virtual_token - tokens_out) = virtual_sol * virtual_token
+    # tokens_out = virtual_token - (virtual_sol * virtual_token) / (virtual_sol + sol_in)
+    # simplified: tokens_out = (sol_in * virtual_token) / (virtual_sol + sol_in)
+    tokens_out = (sol_amount_lamports * virtual_token) // (virtual_sol + sol_amount_lamports)
+    return tokens_out
+
 # ─── Transaction Building ───────────────────────────────────────────────────
 
 def build_buy_ix(
@@ -844,7 +889,7 @@ async def watch_and_snipe(
                     bonding_curve_ata = get_associated_token_address(bonding_curve, mint_pubkey)
                     per_wallet = total_sol / len(active_indices)
 
-                    async def buy_for_wallet(wallet_idx):
+                    async def buy_for_wallet(wallet_idx, token_amount, sol_lamports, max_cost):
                         """Each wallet builds and sends its own independent transaction."""
                         kp = Keypair.from_base58_string(config["wallets"][wallet_idx])
                         buyer = kp.pubkey()
@@ -862,29 +907,42 @@ async def watch_and_snipe(
                             ],
                         )
 
-                        sol_lamports = int(per_wallet * 1e9)
-                        max_cost = int(sol_lamports * (1 + slippage_pct / 100))
                         buy_ix = build_buy_ix(
                             mint_pubkey, bonding_curve, bonding_curve_ata,
-                            buyer, buyer_ata, sol_lamports, max_cost,
+                            buyer, buyer_ata, token_amount, max_cost,
                         )
 
                         cu_limit = set_compute_unit_limit(300_000)
                         cu_price = set_compute_unit_price(priority)
                         return await send_tx_rpc(kp, [cu_limit, cu_price, create_ata_ix, buy_ix])
 
-                    # Fire buys staggered (1.2s apart) to avoid RPC rate limits
-                    results = []
-                    for i in active_indices:
-                        try:
-                            sig = await buy_for_wallet(i)
-                            results.append((i, sig))
-                            await channel.send(f"✅ Wallet {i+1}: `{sig}`")
-                        except Exception as e:
-                            results.append((i, e))
-                            await channel.send(f"❌ Wallet {i+1}: {e}")
-                        if i != active_indices[-1]:
-                            await asyncio.sleep(1.2)
+                    # Calculate token amount from bonding curve
+                    sol_lamports = int(per_wallet * 1e9)
+                    max_cost = int(sol_lamports * (1 + slippage_pct / 100))
+
+                    try:
+                        curve_state = await get_bonding_curve_state(str(bonding_curve))
+                        if curve_state:
+                            token_amount = calculate_tokens_out(sol_lamports, curve_state)
+                            # Apply slippage — accept fewer tokens
+                            token_amount = int(token_amount * (1 - slippage_pct / 100))
+                        else:
+                            # Fallback: use a large token amount and let max_cost be the real limit
+                            token_amount = 1_000_000_000_000
+                    except:
+                        token_amount = 1_000_000_000_000
+
+                    # Fire ALL buys concurrently — speed matters for sniping
+                    results = await asyncio.gather(
+                        *[buy_for_wallet(i, token_amount, sol_lamports, max_cost) for i in active_indices],
+                        return_exceptions=True,
+                    )
+
+                    for i, result in zip(active_indices, results):
+                        if isinstance(result, Exception):
+                            await channel.send(f"❌ Wallet {i+1}: {result}")
+                        else:
+                            await channel.send(f"✅ Wallet {i+1}: `{result}`")
 
                     # Log history
                     config = load_config()
