@@ -871,19 +871,20 @@ async def watch_and_snipe(
 
                         cu_limit = set_compute_unit_limit(300_000)
                         cu_price = set_compute_unit_price(priority)
-                        return await send_tx_jito(kp, [cu_limit, cu_price, create_ata_ix, buy_ix], tip)
+                        return await send_tx_rpc(kp, [cu_limit, cu_price, create_ata_ix, buy_ix])
 
-                    # Fire all buys concurrently — each as its own separate Jito bundle
-                    results = await asyncio.gather(
-                        *[buy_for_wallet(i) for i in active_indices],
-                        return_exceptions=True,
-                    )
-
-                    for i, result in zip(active_indices, results):
-                        if isinstance(result, Exception):
-                            await channel.send(f"❌ Wallet {i+1}: {result}")
-                        else:
-                            await channel.send(f"✅ Wallet {i+1}: `{result}`")
+                    # Fire buys staggered (1.2s apart) to avoid RPC rate limits
+                    results = []
+                    for i in active_indices:
+                        try:
+                            sig = await buy_for_wallet(i)
+                            results.append((i, sig))
+                            await channel.send(f"✅ Wallet {i+1}: `{sig}`")
+                        except Exception as e:
+                            results.append((i, e))
+                            await channel.send(f"❌ Wallet {i+1}: {e}")
+                        if i != active_indices[-1]:
+                            await asyncio.sleep(1.2)
 
                     # Log history
                     config = load_config()
