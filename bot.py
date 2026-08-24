@@ -835,7 +835,7 @@ async def watch_and_snipe(
                         continue
 
                     await channel.send(
-                        f"🚀 **Token launched!** `{mint_address}`\n"
+                        f"@everyone 🚀 **Token launched!** `{mint_address}`\n"
                         f"Firing {len(active_indices)} buys..."
                     )
 
